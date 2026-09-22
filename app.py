@@ -67,6 +67,8 @@ def get_system_font_path():
 
 # ----------------- DOWNLOAD & AUDIO HELPERS -----------------
 
+IOS_USER_AGENT = "com.google.ios.youtube/19.29.1 (iPhone14,5; U; CPU iOS 17_5_1 like Mac OS X; en_US)"
+
 def download_audio_compressed(url, output_dir):
     out_base = os.path.join(output_dir, "audio_track")
     out_mp3 = out_base + ".mp3"
@@ -81,15 +83,16 @@ def download_audio_compressed(url, output_dir):
         'format': 'ba/b',
         'outtmpl': out_base + '.%(ext)s',
         'continuedl': True,
-        'retries': 20,
+        'retries': 15,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web']
+                'player_client': ['ios', 'android'],
+                'player_skip': ['webpage', 'configs'],
             }
         },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Referer': 'https://www.youtube.com/',
+            'User-Agent': IOS_USER_AGENT,
+            'Accept-Language': 'en-US,en;q=0.9',
         },
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
@@ -110,12 +113,14 @@ def get_video_duration(url):
         'no_warnings': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web']
+                'player_client': ['ios', 'android'],
+                'player_skip': ['webpage', 'configs'],
             }
         },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        }
+            'User-Agent': IOS_USER_AGENT,
+        },
+        'nocheckcertificate': True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -123,8 +128,8 @@ def get_video_duration(url):
 
 def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framing_mode, output_path):
     """
-    Bulletproof stream slicing with CRF 23 rate control.
-    Produces crisp 1080p clips capped under 15-20 MB to eliminate MessageSizeError.
+    Slices direct streams using mobile client signatures and encodes with CRF 23.
+    Files stay under 15 MB to prevent MessageSizeError.
     """
     ydl_opts = {
         'format': 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/best',
@@ -132,13 +137,14 @@ def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framin
         'no_warnings': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web']
+                'player_client': ['ios', 'android'],
+                'player_skip': ['webpage', 'configs'],
             }
         },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Referer': 'https://www.youtube.com/',
-        }
+            'User-Agent': IOS_USER_AGENT,
+        },
+        'nocheckcertificate': True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -175,7 +181,7 @@ def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framin
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2[outv]"
         )
 
-    http_headers = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\nReferer: https://www.youtube.com/\r\n"
+    http_headers = f"User-Agent: {IOS_USER_AGENT}\r\n"
 
     cmd = ["ffmpeg", "-y"]
     cmd += ["-headers", http_headers, "-ss", str(start_sec), "-t", str(duration_sec), "-i", v_url]
@@ -193,7 +199,6 @@ def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framin
     else:
         cmd += ["-map", "0:a:0?"]
 
-    # Controlled compression: CRF 23 + maxrate 3500k keeps 30-50s clips under 15 MB
     cmd += [
         "-c:v", "libx264",
         "-preset", "veryfast",
