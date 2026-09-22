@@ -25,6 +25,9 @@ BASE_DIR = os.path.join(os.path.expanduser("~"), "Videos", "AI_Clips")
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# Cookie file detection for YouTube anti-bot bypass
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+
 # ----------------- SESSION STATE -----------------
 
 if "processing" not in st.session_state:
@@ -103,6 +106,10 @@ def download_audio_compressed(url, output_dir):
         'no_warnings': True,
         'nocheckcertificate': True,
     }
+
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts['cookiefile'] = COOKIE_FILE
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
     return out_mp3
@@ -122,6 +129,10 @@ def get_video_duration(url):
         },
         'nocheckcertificate': True,
     }
+
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts['cookiefile'] = COOKIE_FILE
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         return float(info.get('duration', 60.0))
@@ -146,6 +157,10 @@ def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framin
         },
         'nocheckcertificate': True,
     }
+
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts['cookiefile'] = COOKIE_FILE
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         requested_formats = info.get('requested_formats')
@@ -429,6 +444,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     if audio_filters:
         cmd += ["-af", ",".join(audio_filters)]
 
+    # Final render settings: CRF 22 keeps the exported master file crisp and well under 25 MB
     cmd += [
         "-c:v", "libx264",
         "-preset", "veryfast",
