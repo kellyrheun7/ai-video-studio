@@ -49,15 +49,44 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ----------------- FONT RESOLUTION HELPER -----------------
+
+def get_system_font_path():
+    """Detects available fonts across Windows and Linux (Streamlit Cloud)."""
+    candidates = [
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return "Arial"
+
 # ----------------- DOWNLOAD & AUDIO HELPERS -----------------
 
 def download_audio_compressed(url, output_dir):
     out_base = os.path.join(output_dir, "audio_track")
+    out_mp3 = out_base + ".mp3"
+    
+    if os.path.exists(out_mp3):
+        try:
+            os.remove(out_mp3)
+        except Exception:
+            pass
+
     ydl_opts = {
         'format': 'ba/b',
         'outtmpl': out_base + '.%(ext)s',
         'continuedl': True,
         'retries': 20,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web']
+            }
+        },
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Referer': 'https://www.youtube.com/',
@@ -69,15 +98,21 @@ def download_audio_compressed(url, output_dir):
         }],
         'quiet': True,
         'no_warnings': True,
+        'nocheckcertificate': True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
-    return out_base + ".mp3"
+    return out_mp3
 
 def get_video_duration(url):
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web']
+            }
+        },
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         }
@@ -88,12 +123,18 @@ def get_video_duration(url):
 
 def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framing_mode, output_path):
     """
-    Bulletproof stream slicing. Uses split=2 and explicit software buffers so Gaussian Blur never fails.
+    Bulletproof stream slicing with CRF 23 rate control.
+    Produces crisp 1080p clips capped under 15-20 MB to eliminate MessageSizeError.
     """
     ydl_opts = {
-        'format': 'bv*[height<=1080]+ba/b[height<=1080]/best',
+        'format': 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/best',
         'quiet': True,
         'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web']
+            }
+        },
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Referer': 'https://www.youtube.com/',
@@ -148,16 +189,21 @@ def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framin
         cmd += ["-map", "0:v:0"]
 
     if a_url:
-        cmd += ["-map", "1:a:0"]
+        cmd += ["-map", "1:a:0?"]
     else:
         cmd += ["-map", "0:a:0?"]
 
+    # Controlled compression: CRF 23 + maxrate 3500k keeps 30-50s clips under 15 MB
     cmd += [
         "-c:v", "libx264",
-        "-preset", "ultrafast",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-maxrate", "3500k",
+        "-bufsize", "7000k",
+        "-pix_fmt", "yuv420p",
         "-avoid_negative_ts", "make_zero",
         "-c:a", "aac",
-        "-b:a", "192k",
+        "-b:a", "128k",
         "-af", "aresample=async=1000",
         output_path
     ]
@@ -187,7 +233,7 @@ def snap_to_sentence_boundary(segments, raw_end, max_drift=2.5):
 def analyze_highlights_guaranteed_3(segments, total_duration, gemini_key):
     transcript_text = ""
     for seg in segments:
-        clean_t = seg["text"].strip()
+        clean_t = seg.get("text", "").strip()
         if clean_t and not re.search(r'\[.*music.*\]|\(music\)|♪', clean_t, re.IGNORECASE):
             transcript_text += f"[{round(seg['start'], 2)}s -> {round(seg['end'], 2)}s]: {clean_t}\n"
 
@@ -206,7 +252,7 @@ Transcript:
 {transcript_text}
 """
     clips = []
-    models = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    models = ["gemini-2.5-flash", "gemini-1.5-flash"]
     for m in models:
         try:
             res = client.models.generate_content(
@@ -247,9 +293,9 @@ def get_clip_words_json(transcription, start_sec, end_sec):
             if seg_words:
                 words.extend(seg_words)
             else:
-                txt = seg['text'].strip()
+                txt = seg.get('text', '').strip()
                 if not re.search(r'\[.*music.*\]|\(music\)|♪', txt, re.IGNORECASE):
-                    words.append({'start': seg['start'], 'end': seg['end'], 'word': txt})
+                    words.append({'start': seg.get('start', 0.0), 'end': seg.get('end', 0.0), 'word': txt})
 
     for w in words:
         s = w.get('start', 0.0)
@@ -267,9 +313,7 @@ def get_clip_words_json(transcription, start_sec, end_sec):
 # ----------------- FINAL EXPORT WITH ANIMATED KARAOKE POP -----------------
 
 def compile_final_export(raw_video, out_video, color_cfg, audio_boost, pov_cfg, sub_cfg, cur_clip, trans_data):
-    win_font_dir = "C:/Windows/Fonts/arialbd.ttf"
-    if not os.path.exists(win_font_dir):
-        win_font_dir = "C:/Windows/Fonts/arial.ttf"
+    font_path = get_system_font_path()
 
     filter_chains = []
     curr_v = "[0:v]"
@@ -306,7 +350,7 @@ def compile_final_export(raw_video, out_video, color_cfg, audio_boost, pov_cfg, 
             shadow_cmd = f":shadowx=6:shadowy=6:shadowcolor=black@{s_op:.2f}"
 
         draw_cmd = (
-            f"{curr_v}drawtext=fontfile='{win_font_dir}':text='{safe_pov}':fontsize={txt_size}:"
+            f"{curr_v}drawtext=fontfile='{font_path}':text='{safe_pov}':fontsize={txt_size}:"
             f"fontcolor={txt_col}:box=1:boxcolor={bg_col}@0.95:boxborderw={bw_pad}:"
             f"x={bx}:y={by}{shadow_cmd}[with_pov]"
         )
@@ -337,7 +381,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         raw_words = json.loads(get_clip_words_json(trans_data, cur_clip["start"], cur_clip["end"]))
         events = []
 
-        # High-energy 1-to-2 word burst groups with scale pop animation
         chunk = []
         for w in raw_words:
             chunk.append(w)
@@ -345,7 +388,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 cs = chunk[0]["start"]
                 ce = chunk[-1]["end"]
                 txt = " ".join([c["text"] for c in chunk])
-                # \\t(0, 100, \\fscx115\\fscy115) creates the punchy pop effect
                 pop_effect = "{\\fscx100\\fscy100\\t(0,80,\\fscx118\\fscy118)\\t(80,160,\\fscx100\\fscy100)}"
                 pos_tag = f"{{\\pos({pos_x},{1920 - pos_y})}}"
                 events.append(f"Dialogue: 0,{time.strftime('%H:%M:%S.00', time.gmtime(cs))},{time.strftime('%H:%M:%S.00', time.gmtime(ce))},MainSub,,0,0,0,,{pos_tag}{pop_effect}{txt}")
@@ -384,7 +426,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     cmd += [
         "-c:v", "libx264",
-        "-preset", "ultrafast",
+        "-preset", "veryfast",
+        "-crf", "22",
+        "-maxrate", "4000k",
+        "-bufsize", "8000k",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "192k",
         out_video
@@ -589,7 +635,6 @@ if st.session_state.discovered_clips:
                 let activeIdx = -1;
                 let activeChunk = '';
 
-                // Rapid 2-word punchy bursts with zero latency
                 for (let i = 0; i < words.length; i += 2) {{
                     const chunk = words.slice(i, i + 2);
                     const start = chunk[0].start;
@@ -604,7 +649,6 @@ if st.session_state.discovered_clips:
                 if (activeIdx !== -1) {{
                     if (activeIdx !== lastWordIdx) {{
                         subText.innerText = activeChunk;
-                        // Trigger CSS pop bounce
                         subText.classList.remove('pop-active');
                         void subText.offsetWidth;
                         subText.classList.add('pop-active');
