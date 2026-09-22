@@ -1,4 +1,6 @@
 streamlit
+yt-dlp
+gdown
 requests
 groq
 google-genai
