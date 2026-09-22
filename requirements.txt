@@ -1,7 +1,6 @@
 streamlit
-yt-dlp
+yt-dlp>=2025.1.1
 groq
-gradio_client
 google-genai
 requests
 pillow
