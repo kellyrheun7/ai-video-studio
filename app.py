@@ -4,10 +4,10 @@ import json
 import time
 import shutil
 import base64
+import requests
 import subprocess
 import streamlit as st
 import streamlit.components.v1 as components
-import yt_dlp
 from groq import Groq
 from google import genai
 
@@ -24,20 +24,6 @@ st.set_page_config(
 BASE_DIR = os.path.join(os.path.expanduser("~"), "Videos", "AI_Clips")
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
-
-# ----------------- COOKIE DETECTION HELPER -----------------
-
-def get_cookie_file():
-    """Locates cookies.txt across multiple possible working directory paths."""
-    candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"),
-        os.path.join(os.getcwd(), "cookies.txt"),
-        "cookies.txt"
-    ]
-    for p in candidates:
-        if os.path.exists(p) and os.path.getsize(p) > 0:
-            return p
-    return None
 
 # ----------------- SESSION STATE -----------------
 
@@ -66,7 +52,6 @@ st.markdown("""
 # ----------------- FONT RESOLUTION HELPER -----------------
 
 def get_system_font_path():
-    """Detects available fonts across Windows and Linux (Streamlit Cloud)."""
     candidates = [
         "C:/Windows/Fonts/arialbd.ttf",
         "C:/Windows/Fonts/arial.ttf",
@@ -79,119 +64,90 @@ def get_system_font_path():
             return c
     return "Arial"
 
-# ----------------- DOWNLOAD & AUDIO HELPERS -----------------
+# ----------------- PROXY-BASED DOWNLOAD ENGINES (COBALT & PIPED) -----------------
 
-BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-def download_audio_compressed(url, output_dir):
-    out_base = os.path.join(output_dir, "audio_track")
-    out_mp3 = out_base + ".mp3"
+def download_via_proxy(youtube_url, output_path, is_audio_only=False):
+    """
+    Downloads media through a rotating network of public proxy instances.
+    Bypasses datacenter 403 Forbidden errors by routing outside cloud IPs.
+    """
+    instances = [
+        "https://api.cobalt.tools/api/json",
+        "https://cobalt-api.kwiatekm.tokyo/api/json",
+        "https://api.wuk.sh/api/json"
+    ]
     
-    if os.path.exists(out_mp3):
+    payload = {
+        "url": youtube_url,
+        "videoQuality": "720",
+        "downloadMode": "audio" if is_audio_only else "auto",
+        "audioFormat": "mp3" if is_audio_only else "best"
+    }
+    
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+
+    download_link = None
+    for inst in instances:
         try:
-            os.remove(out_mp3)
+            r = requests.post(inst, json=payload, headers=headers, timeout=12)
+            if r.status_code == 200:
+                data = r.json()
+                if "url" in data:
+                    download_link = data["url"]
+                    break
         except Exception:
-            pass
+            continue
 
-    cookie_path = get_cookie_file()
+    if not download_link:
+        # Fallback to direct Piped manifest resolve
+        video_id_match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", youtube_url)
+        if video_id_match:
+            vid = video_id_match.group(1)
+            piped_instances = ["https://pipedapi.kavin.rocks", "https://api.piped.private.coffee"]
+            for p_inst in piped_instances:
+                try:
+                    resp = requests.get(f"{p_inst}/streams/{vid}", timeout=10)
+                    if resp.status_code == 200:
+                        stream_data = resp.json()
+                        streams = stream_data.get("audioStreams" if is_audio_only else "videoStreams", [])
+                        if streams:
+                            download_link = streams[0].get("url")
+                            break
+                except Exception:
+                    continue
 
-    ydl_opts = {
-        'format': 'ba/b/bestaudio',
-        'outtmpl': out_base + '.%(ext)s',
-        'continuedl': False,
-        'retries': 15,
-        'fragment_retries': 15,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'tv_embedded', 'android', 'web'],
-                'player_skip': ['configs'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': BROWSER_USER_AGENT,
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.youtube.com/',
-        },
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '64',
-        }],
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-    }
+    if not download_link:
+        raise RuntimeError("Proxy servers could not resolve this stream. Verify the video link.")
 
-    if cookie_path:
-        ydl_opts['cookiefile'] = cookie_path
+    # Stream the file content down in chunks
+    with requests.get(download_link, stream=True, timeout=60) as stream_resp:
+        stream_resp.raise_for_status()
+        with open(output_path, "wb") as f:
+            for chunk in stream_resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    return output_path
 
-    return out_mp3
+def get_media_duration_ffprobe(file_path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file_path
+    ]
+    res = subprocess.check_output(cmd).decode().strip()
+    return float(res)
 
-def get_video_duration(url):
-    cookie_path = get_cookie_file()
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'tv_embedded', 'android', 'web'],
-                'player_skip': ['configs'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': BROWSER_USER_AGENT,
-            'Referer': 'https://www.youtube.com/',
-        },
-        'nocheckcertificate': True,
-    }
-
-    if cookie_path:
-        ydl_opts['cookiefile'] = cookie_path
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return float(info.get('duration', 60.0))
-
-def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framing_mode, output_path):
+def slice_local_master_clip(master_path, start_sec, duration_sec, aspect_choice, framing_mode, output_path):
     """
-    Slices direct streams and encodes with CRF 23.
-    Keeps subclips under 15 MB to prevent MessageSizeError.
+    Slices the pre-downloaded master video locally.
+    Guarantees zero network latency, zero 403 errors, and caps size under 15 MB.
     """
-    cookie_path = get_cookie_file()
-    ydl_opts = {
-        'format': 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/best',
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'tv_embedded', 'android', 'web'],
-                'player_skip': ['configs'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': BROWSER_USER_AGENT,
-            'Referer': 'https://www.youtube.com/',
-        },
-        'nocheckcertificate': True,
-    }
-
-    if cookie_path:
-        ydl_opts['cookiefile'] = cookie_path
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        requested_formats = info.get('requested_formats')
-        if requested_formats and len(requested_formats) >= 2:
-            v_url = requested_formats[0].get('url')
-            a_url = requested_formats[1].get('url')
-        else:
-            v_url = info.get('url')
-            a_url = None
-
     aspect_map = {
         "9:16 Vertical": (1080, 1920),
         "1:1 Square": (1080, 1080),
@@ -217,23 +173,12 @@ def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framin
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2[outv]"
         )
 
-    http_headers = f"User-Agent: {BROWSER_USER_AGENT}\r\nReferer: https://www.youtube.com/\r\n"
-
-    cmd = ["ffmpeg", "-y"]
-    cmd += ["-headers", http_headers, "-ss", str(start_sec), "-t", str(duration_sec), "-i", v_url]
-    
-    if a_url:
-        cmd += ["-headers", http_headers, "-ss", str(start_sec), "-t", str(duration_sec), "-i", a_url]
+    cmd = ["ffmpeg", "-y", "-ss", str(start_sec), "-t", str(duration_sec), "-i", master_path]
 
     if filter_complex:
-        cmd += ["-filter_complex", filter_complex, "-map", "[outv]"]
+        cmd += ["-filter_complex", filter_complex, "-map", "[outv]", "-map", "0:a?"]
     else:
-        cmd += ["-map", "0:v:0"]
-
-    if a_url:
-        cmd += ["-map", "1:a:0?"]
-    else:
-        cmd += ["-map", "0:a:0?"]
+        cmd += ["-map", "0:v", "-map", "0:a?"]
 
     cmd += [
         "-c:v", "libx264",
@@ -242,18 +187,16 @@ def slice_and_frame_raw_clip(url, start_sec, duration_sec, aspect_choice, framin
         "-maxrate", "3500k",
         "-bufsize", "7000k",
         "-pix_fmt", "yuv420p",
-        "-avoid_negative_ts", "make_zero",
         "-c:a", "aac",
         "-b:a", "128k",
-        "-af", "aresample=async=1000",
         output_path
     ]
 
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0 or not os.path.exists(output_path):
-        raise RuntimeError(f"FFmpeg slicing failed:\n{proc.stderr[-500:]}")
+        raise RuntimeError(f"FFmpeg slicing error:\n{proc.stderr[-500:]}")
 
-# ----------------- HIGHLIGHT DISCOVERY & SNAPPER -----------------
+# ----------------- HIGHLIGHT DISCOVERY -----------------
 
 def snap_to_sentence_boundary(segments, raw_end, max_drift=2.5):
     best_end = raw_end
@@ -483,7 +426,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 # ----------------- UI DASHBOARD -----------------
 
 st.title("🎬 AI Anime Shorts Studio Pro")
-st.caption("Kinetic Pop Captions • Gaussian Blur Recovery • Zero-Desync Architecture")
+st.caption("Proxy-Powered Stream Engine • Zero-Desync Architecture • Kinetic Captions")
 
 with st.sidebar:
     st.header("🎯 Target Aspect Ratio")
@@ -503,13 +446,23 @@ if start_btn and source_url:
     st.session_state.discovered_clips = []
     st.session_state.exported_file_path = None
 
-    pbar = st.progress(0, text="[0%] Initializing...")
+    pbar = st.progress(0, text="[0%] Initializing proxy stream...")
 
     try:
-        pbar.progress(15, text="[15%] Downloading lightweight audio (~3 MB)...")
-        audio_p = download_audio_compressed(source_url, CACHE_DIR)
-        total_duration = get_video_duration(source_url)
+        # Step 1: Download 720p master video via proxy network (bypasses 403 blocks)
+        master_video_path = os.path.join(CACHE_DIR, "source_master.mp4")
+        pbar.progress(15, text="[15%] Routing video download through external proxy...")
+        download_via_proxy(source_url, master_video_path, is_audio_only=False)
 
+        # Extract lightweight audio for transcription
+        audio_p = os.path.join(CACHE_DIR, "audio_track.mp3")
+        subprocess.run([
+            "ffmpeg", "-y", "-i", master_video_path,
+            "-vn", "-acodec", "libmp3lame", "-b:a", "64k", audio_p
+        ], check=True)
+        total_duration = get_media_duration_ffprobe(master_video_path)
+
+        # Step 2: Groq Whisper transcription
         pbar.progress(35, text="[35%] Transcribing dialogue with Groq Whisper...")
         client_g = Groq(api_key=DEFAULT_GROQ_KEY)
         with open(audio_p, "rb") as f:
@@ -521,15 +474,17 @@ if start_btn and source_url:
             )
         st.session_state.transcription_data = trans
 
+        # Step 3: Discover top 3 highlights via Gemini
         pbar.progress(55, text="[55%] Discovering 3 high-retention highlights...")
         clips = analyze_highlights_guaranteed_3(trans.segments, total_duration, DEFAULT_GEMINI_KEY)
 
+        # Step 4: Slice clips locally from the master video
         for i, clip in enumerate(clips):
             step = 60 + int((i / len(clips)) * 35)
-            pbar.progress(step, text=f"[{step}%] Cutting Short {i+1} with full audio...")
+            pbar.progress(step, text=f"[{step}%] Cutting Short {i+1}...")
             raw_path = os.path.join(CACHE_DIR, f"framed_clip_{i+1}.mp4")
             dur = clip["end"] - clip["start"]
-            slice_and_frame_raw_clip(source_url, clip["start"], dur, pre_aspect, pre_framing, raw_path)
+            slice_local_master_clip(master_video_path, clip["start"], dur, pre_aspect, pre_framing, raw_path)
             clip["raw_path"] = raw_path
 
         pbar.progress(100, text="[100%] Complete! 3 Shorts loaded below.")
@@ -634,7 +589,6 @@ if st.session_state.discovered_clips:
         shadow_style = f"box-shadow: 0px 6px 14px rgba(0, 0, 0, {shadow_op});" if has_shadow else ""
         pov_text_color = "black" if pov_bg in ["white", "yellow"] else "white"
 
-        # Interactive HTML5/JS Player with Kinetic Pop CSS Animations
         live_editor_html = f"""
         <style>
             @keyframes popAnim {{
@@ -654,7 +608,6 @@ if st.session_state.discovered_clips:
                 {pov_text}
             </div>
 
-            <!-- Kinetic Pop Subtitle Layer -->
             <div id="sub_overlay" style="position: absolute; left: {sub_x}%; bottom: {sub_y}px; transform: translateX(-50%); font-family: '{sub_font}', sans-serif; font-size: {sub_size}px; color: {sub_color_code}; text-align: center; text-transform: uppercase; font-weight: 900; pointer-events: none; width: 90%; z-index: 20; {'background: rgba(0,0,0,0.7); padding: 6px 12px; border-radius: 6px;' if sub_border_mode == 'Opaque Backing Box' else 'text-shadow: -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000, 0 4px 10px rgba(0,0,0,0.8);'}">
                 <span id="sub_text" class="pop-active"></span>
             </div>
