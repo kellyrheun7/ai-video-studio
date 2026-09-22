@@ -1,5 +1,6 @@
 streamlit
 yt-dlp
+groq
 gradio_client
 google-genai
 requests
