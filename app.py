@@ -4,10 +4,12 @@ import json
 import time
 import shutil
 import base64
-import requests
 import subprocess
+import requests
+import gdown
 import streamlit as st
 import streamlit.components.v1 as components
+import yt_dlp
 from groq import Groq
 from google import genai
 
@@ -52,6 +54,7 @@ st.markdown("""
 # ----------------- FONT RESOLUTION HELPER -----------------
 
 def get_system_font_path():
+    """Detects available system fonts across Windows and Linux environments."""
     candidates = [
         "C:/Windows/Fonts/arialbd.ttf",
         "C:/Windows/Fonts/arial.ttf",
@@ -64,74 +67,61 @@ def get_system_font_path():
             return c
     return "Arial"
 
-# ----------------- PROXY-BASED DOWNLOAD ENGINES (COBALT & PIPED) -----------------
+# ----------------- UNIVERSAL INGESTION ENGINES -----------------
 
-def download_via_proxy(youtube_url, output_path, is_audio_only=False):
-    """
-    Downloads media through a rotating network of public proxy instances.
-    Bypasses datacenter 403 Forbidden errors by routing outside cloud IPs.
-    """
-    instances = [
-        "https://api.cobalt.tools/api/json",
-        "https://cobalt-api.kwiatekm.tokyo/api/json",
-        "https://api.wuk.sh/api/json"
+def get_cookie_file():
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"),
+        os.path.join(os.getcwd(), "cookies.txt"),
+        "cookies.txt"
     ]
-    
-    payload = {
-        "url": youtube_url,
-        "videoQuality": "720",
-        "downloadMode": "audio" if is_audio_only else "auto",
-        "audioFormat": "mp3" if is_audio_only else "best"
+    for p in candidates:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            return p
+    return None
+
+def fetch_external_url(url, dest_path):
+    """
+    Downloads media from Google Drive, X, Twitch, YouTube, or direct links.
+    """
+    # 1. Google Drive Detection
+    if "drive.google.com" in url:
+        gdown.download(url, dest_path, quiet=False, fuzzy=True)
+        if not os.path.exists(dest_path):
+            raise RuntimeError("Could not download file from Google Drive. Ensure link sharing is set to 'Anyone with link'.")
+        return dest_path
+
+    # 2. Universal yt-dlp Extractor (YouTube, X, Twitch, etc.)
+    cookie_p = get_cookie_file()
+    ydl_opts = {
+        'format': 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/best',
+        'outtmpl': dest_path,
+        'quiet': True,
+        'no_warnings': True,
+        'continuedl': False,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        },
+        'nocheckcertificate': True
     }
+    if cookie_p:
+        ydl_opts['cookiefile'] = cookie_p
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    if not os.path.exists(dest_path):
+        # yt-dlp might append extension automatically
+        base, _ = os.path.splitext(dest_path)
+        for ext in [".mp4", ".mkv", ".webm"]:
+            if os.path.exists(base + ext):
+                shutil.move(base + ext, dest_path)
+                break
+
+    if not os.path.exists(dest_path):
+        raise RuntimeError("Failed to download video from the provided link.")
     
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
-
-    download_link = None
-    for inst in instances:
-        try:
-            r = requests.post(inst, json=payload, headers=headers, timeout=12)
-            if r.status_code == 200:
-                data = r.json()
-                if "url" in data:
-                    download_link = data["url"]
-                    break
-        except Exception:
-            continue
-
-    if not download_link:
-        # Fallback to direct Piped manifest resolve
-        video_id_match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", youtube_url)
-        if video_id_match:
-            vid = video_id_match.group(1)
-            piped_instances = ["https://pipedapi.kavin.rocks", "https://api.piped.private.coffee"]
-            for p_inst in piped_instances:
-                try:
-                    resp = requests.get(f"{p_inst}/streams/{vid}", timeout=10)
-                    if resp.status_code == 200:
-                        stream_data = resp.json()
-                        streams = stream_data.get("audioStreams" if is_audio_only else "videoStreams", [])
-                        if streams:
-                            download_link = streams[0].get("url")
-                            break
-                except Exception:
-                    continue
-
-    if not download_link:
-        raise RuntimeError("Proxy servers could not resolve this stream. Verify the video link.")
-
-    # Stream the file content down in chunks
-    with requests.get(download_link, stream=True, timeout=60) as stream_resp:
-        stream_resp.raise_for_status()
-        with open(output_path, "wb") as f:
-            for chunk in stream_resp.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-    return output_path
+    return dest_path
 
 def get_media_duration_ffprobe(file_path):
     cmd = [
@@ -144,10 +134,6 @@ def get_media_duration_ffprobe(file_path):
     return float(res)
 
 def slice_local_master_clip(master_path, start_sec, duration_sec, aspect_choice, framing_mode, output_path):
-    """
-    Slices the pre-downloaded master video locally.
-    Guarantees zero network latency, zero 403 errors, and caps size under 15 MB.
-    """
     aspect_map = {
         "9:16 Vertical": (1080, 1920),
         "1:1 Square": (1080, 1080),
@@ -426,7 +412,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 # ----------------- UI DASHBOARD -----------------
 
 st.title("🎬 AI Anime Shorts Studio Pro")
-st.caption("Proxy-Powered Stream Engine • Zero-Desync Architecture • Kinetic Captions")
+st.caption("Universal Stream Engine • Zero-Desync Architecture • Kinetic Pop Captions")
 
 with st.sidebar:
     st.header("🎯 Target Aspect Ratio")
@@ -434,27 +420,42 @@ with st.sidebar:
     pre_framing = st.radio("Framing Mode", ["True Crop (Auto-Center Subject)", "Padded Blur Fit", "Padded Black Bars"])
 
 st.subheader("1. Source Video")
-in_col1, in_col2 = st.columns([3, 1])
+input_mode = st.radio("Choose Input Method:", ["📁 Upload Video File (Recommended for Mobile)", "🔗 Paste Video Link (Drive, X, Twitch, YouTube)"], horizontal=True)
 
-with in_col1:
-    source_url = st.text_input("Paste YouTube Link:", placeholder="https://www.youtube.com/watch?v=...")
-with in_col2:
-    start_btn = st.button("⚡ Generate Top 3 Shorts", type="primary", disabled=st.session_state.processing)
+uploaded_file = None
+source_url = None
 
-if start_btn and source_url:
+if "Upload" in input_mode:
+    uploaded_file = st.file_uploader("Upload video file (MP4, MOV, MKV, WebM):", type=["mp4", "mov", "mkv", "webm"])
+    start_btn = st.button("⚡ Generate Top 3 Shorts", type="primary", disabled=(uploaded_file is None or st.session_state.processing))
+else:
+    in_col1, in_col2 = st.columns([3, 1])
+    with in_col1:
+        source_url = st.text_input("Paste Link:", placeholder="https://drive.google.com/... or https://x.com/...")
+    with in_col2:
+        start_btn = st.button("⚡ Generate Top 3 Shorts", type="primary", disabled=(not source_url or st.session_state.processing))
+
+if start_btn:
     st.session_state.processing = True
     st.session_state.discovered_clips = []
     st.session_state.exported_file_path = None
 
-    pbar = st.progress(0, text="[0%] Initializing proxy stream...")
+    pbar = st.progress(0, text="[0%] Initializing...")
 
     try:
-        # Step 1: Download 720p master video via proxy network (bypasses 403 blocks)
         master_video_path = os.path.join(CACHE_DIR, "source_master.mp4")
-        pbar.progress(15, text="[15%] Routing video download through external proxy...")
-        download_via_proxy(source_url, master_video_path, is_audio_only=False)
 
-        # Extract lightweight audio for transcription
+        # Step 1: Save or fetch video
+        if uploaded_file is not None:
+            pbar.progress(10, text="[10%] Ingesting uploaded file...")
+            with open(master_video_path, "wb") as f:
+                f.write(uploaded_file.read())
+        else:
+            pbar.progress(10, text="[10%] Fetching stream from URL...")
+            fetch_external_url(source_url, master_video_path)
+
+        # Step 2: Extract audio track for Groq Whisper
+        pbar.progress(25, text="[25%] Extracting audio track...")
         audio_p = os.path.join(CACHE_DIR, "audio_track.mp3")
         subprocess.run([
             "ffmpeg", "-y", "-i", master_video_path,
@@ -462,8 +463,8 @@ if start_btn and source_url:
         ], check=True)
         total_duration = get_media_duration_ffprobe(master_video_path)
 
-        # Step 2: Groq Whisper transcription
-        pbar.progress(35, text="[35%] Transcribing dialogue with Groq Whisper...")
+        # Step 3: Transcription
+        pbar.progress(40, text="[40%] Transcribing dialogue with Groq Whisper...")
         client_g = Groq(api_key=DEFAULT_GROQ_KEY)
         with open(audio_p, "rb") as f:
             trans = client_g.audio.transcriptions.create(
@@ -474,13 +475,13 @@ if start_btn and source_url:
             )
         st.session_state.transcription_data = trans
 
-        # Step 3: Discover top 3 highlights via Gemini
-        pbar.progress(55, text="[55%] Discovering 3 high-retention highlights...")
+        # Step 4: Highlight Discovery via Gemini
+        pbar.progress(60, text="[60%] Discovering top 3 retention highlights...")
         clips = analyze_highlights_guaranteed_3(trans.segments, total_duration, DEFAULT_GEMINI_KEY)
 
-        # Step 4: Slice clips locally from the master video
+        # Step 5: Slice Clips
         for i, clip in enumerate(clips):
-            step = 60 + int((i / len(clips)) * 35)
+            step = 65 + int((i / len(clips)) * 30)
             pbar.progress(step, text=f"[{step}%] Cutting Short {i+1}...")
             raw_path = os.path.join(CACHE_DIR, f"framed_clip_{i+1}.mp4")
             dur = clip["end"] - clip["start"]
